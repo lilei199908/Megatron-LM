@@ -87,36 +87,6 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
-def _count_weight_syncs(nvtx_ranges: list[str]) -> int:
-    return sum(message == "sync_model_weight_from_main_weight" for message in nvtx_ranges)
-
-
-def _make_unwrapped_parent_microbatch_model(
-    device: torch.device, mesh
-) -> tuple[nn.Sequential, tuple]:
-    model = nn.Sequential(
-        nn.Linear(1, 1, bias=False, dtype=torch.bfloat16),
-        nn.Linear(1, 1, bias=False, dtype=torch.bfloat16),
-    ).to(device)
-    with torch.no_grad():
-        for layer in model:
-            layer.weight.fill_(1.0)
-
-    for layer in model:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-        )
-
-    assert not hasattr(model, "parameter_groups")
-    groups = tuple(layer.parameter_groups()[0] for layer in model)
-    for group in groups:
-        assert group.main_weight is not group.model_weight
-    return model, groups
-
-
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
     """Minimal per-module FSDP training should match single-rank SGD."""
@@ -276,72 +246,25 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
-def test_microbatch_false_scopes_unwrapped_parent_child_contexts(distributed_setup):
-    """An unwrapped parent can set child FSDP contexts to a non-first microbatch."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model, _groups = _make_unwrapped_parent_microbatch_model(device, mesh)
-
-    with microbatch(model, is_first=False):
-        contexts = tuple(layer._context for layer in model)
-        assert all(context is not None for context in contexts)
-        assert all(not context.is_first_microbatch for context in contexts)
-    assert tuple(layer._context for layer in model) == contexts
-    assert all(context.is_first_microbatch for context in contexts)
-
-
-def test_microbatch_training_syncs_once_per_minibatch(distributed_setup, monkeypatch):
-    """Training with microbatches syncs main weights once per FSDP unit per minibatch."""
+def test_microbatch_scopes_child_contexts(distributed_setup):
+    """microbatch() should scope FSDP child contexts under an unwrapped parent."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(
-        nn.Linear(1, 1, bias=False, dtype=torch.bfloat16),
-        nn.Linear(1, 1, bias=False, dtype=torch.bfloat16),
+        nn.Linear(1, 1, bias=False),
+        nn.Linear(1, 1, bias=False),
     ).to(device)
-    with torch.no_grad():
+    for layer in model:
+        fully_shard(layer, mesh=mesh, placements=_flat_placements())
+
+    with microbatch(model, is_first=False):
         for layer in model:
-            layer.weight.fill_(1.0)
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-    )
-    groups = model.parameter_groups()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
-    x_microbatches = (
-        torch.ones(1, 1, device=device, dtype=torch.bfloat16),
-        torch.full((1, 1), 2.0, device=device, dtype=torch.bfloat16),
-    )
-    nvtx_ranges: list[str] = []
+            assert not layer.context.is_first_microbatch
 
-    original_range_push = torch.cuda.nvtx.range_push
-
-    def range_push_spy(message: str) -> None:
-        nvtx_ranges.append(message)
-        original_range_push(message)
-
-    monkeypatch.setattr(torch.cuda.nvtx, "range_push", range_push_spy)
-
-    for _step in range(2):
-        optimizer.zero_grad(set_to_none=True)
-        nvtx_ranges.clear()
-        for microbatch_index, x in enumerate(x_microbatches):
-            with microbatch(model, is_first=microbatch_index == 0):
-                loss = model(x).float().sum() / len(x_microbatches)
-            assert _count_weight_syncs(nvtx_ranges) == len(groups), (
-                "main weights should sync once per FSDP group on the first microbatch, "
-                "and not again on later microbatches in the same minibatch"
-            )
-            loss.backward()
-        assert _count_weight_syncs(nvtx_ranges) == len(groups), (
-            "main weights should sync once per FSDP group over the full minibatch"
-        )
-        optimizer.step()
+    for layer in model:
+        assert layer.context.is_first_microbatch
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):

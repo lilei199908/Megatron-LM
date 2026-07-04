@@ -72,13 +72,10 @@ class FsdpModule:
         )
         self._register_hooks()
 
-    def _assign_context(self, context: FsdpContext) -> None:
-        self._context = context
-
-    def _lazy_init_context(self) -> FsdpContext:
+    def _lazy_init_context(self) -> None:
         """Initialize the shared runtime context for this FSDP root subtree."""
         if self._context is not None:
-            return self._context
+            return
 
         context = FsdpContext()
         for submodule in cast(nn.Module, self).modules():
@@ -89,8 +86,13 @@ class FsdpModule:
                     "FSDP context is already initialized for a descendant module. "
                     "Run forward through the root FSDP module first."
                 )
-            submodule._assign_context(context)
-        return context
+            submodule._context = context
+
+    @property
+    def context(self) -> FsdpContext:
+        """Return the initialized runtime context."""
+        assert self._context is not None
+        return self._context
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
@@ -117,11 +119,10 @@ class FsdpModule:
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
-        context = self._lazy_init_context()
+        self._lazy_init_context()
         self._ready_grad_parameters.clear()
         for group in self._parameter_groups:
-            if context.is_first_microbatch:
-                group.sync_model_weight_from_main_weight()
+            group.sync_model_weight_from_main_weight()
             group.unshard_parameters()
 
     def post_forward(self) -> None:

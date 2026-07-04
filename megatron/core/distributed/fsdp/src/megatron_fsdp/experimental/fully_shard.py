@@ -68,7 +68,7 @@ def fully_shard(
 
 @contextmanager
 def microbatch(module: nn.Module, is_first: bool) -> Iterator[None]:
-    """Scope experimental FSDP main-weight synchronization to one microbatch.
+    """Scope experimental FSDP state to one microbatch.
 
     Args:
         module: Module tree whose experimental FSDP roots should use this microbatch state.
@@ -100,7 +100,8 @@ def _collect_fsdp_contexts(
     contexts: list[FsdpContext],
 ) -> None:
     if isinstance(module, FsdpModule):
-        contexts.append(module._lazy_init_context())
+        module._lazy_init_context()
+        contexts.append(module.context)
         return
 
     for child in module.children():
